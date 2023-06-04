@@ -1,0 +1,258 @@
+From 2a03e0b59bd00dd529f2f5f6e78bc16684c5ce72 Mon Sep 17 00:00:00 2001
+From: hwzhuhao <923196325@qq.com>
+Date: Sun, 4 Jun 2023 12:08:10 +0800
+Subject: [PATCH] feat(fluent-bit-watcher): add fluent-bit timeout when config
+ change
+
+Signed-off-by: hwzhuhao <923196325@qq.com>
+---
+ Makefile                          |  9 +++++-
+ cmd/fluent-bit-watcher/Dockerfile |  7 ++--
+ cmd/fluent-bit-watcher/main.go    | 68 ++++++++++++++++++++++++++-------------
+ go.mod                            |  2 +-
+ go.sum                            |  2 +-
+ 5 files changed, 60 insertions(+), 28 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 36f940b..8f57f2d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -63,18 +63,25 @@ test: manifests generate fmt vet ## Run tests.
+ 
+ ##@ Build
+ 
++# Build manager and watcher binary
+ binary:
+ 	go build -o bin/manager cmd/manager/main.go
+ 	go build -o bin/watcher cmd/fluent-bit-watcher/main.go
+ 
++# Clean manager and watcher binary
++clean:
++	rm -rf bin/*
++
+ verify: verify-crds
+ 
+ verify-crds:
+ 	sudo chmod a+x ./hack/verify-crds.sh && ./hack/verify-crds.sh
+ 
+-build: generate fmt vet ## Build manager binary.
++# Build manager binary
++build: generate fmt vet 
+ 	go build -o bin/manager cmd/manager/main.go
+ 
++# Run manager
+ run: manifests generate fmt vet ## Run a controller from your host.
+ 	go run cmd/manager/main.go
+ 
+diff --git a/cmd/fluent-bit-watcher/Dockerfile b/cmd/fluent-bit-watcher/Dockerfile
+index 2eb5086..1acb9a3 100644
+--- a/cmd/fluent-bit-watcher/Dockerfile
++++ b/cmd/fluent-bit-watcher/Dockerfile
+@@ -1,12 +1,13 @@
+-FROM golang:1.13.6-alpine3.11 as buildergo
++FROM golang:1.16 as buildergo
++ENV GORPXOY=https://goproxy.cn,direct
+ RUN mkdir -p /fluent-bit
+ RUN mkdir -p /code
+ COPY . /code/
+ WORKDIR /code
+ RUN echo $(ls -al /code)
+-RUN CGO_ENABLED=0 go build -i -ldflags '-w -s' -o /fluent-bit/fluent-bit /code/cmd/fluent-bit-watcher/main.go
++RUN CGO_ENABLED=0 go build -ldflags '-w -s' -o /fluent-bit/fluent-bit /code/cmd/fluent-bit-watcher/main.go
+ 
+-FROM fluent/fluent-bit:1.8.3
++FROM fluent/fluent-bit:1.9.10
+ LABEL Description="Fluent Bit docker image" Vendor="KubeSphere" Version="1.0"
+ 
+ COPY conf/fluent-bit.conf conf/parsers.conf /fluent-bit/etc/
+diff --git a/cmd/fluent-bit-watcher/main.go b/cmd/fluent-bit-watcher/main.go
+index 4190f20..25608db 100644
+--- a/cmd/fluent-bit-watcher/main.go
++++ b/cmd/fluent-bit-watcher/main.go
+@@ -12,8 +12,8 @@ import (
+ 	"time"
+ 
+ 	"github.com/fsnotify/fsnotify"
+-	"github.com/go-kit/kit/log"
+-	"github.com/go-kit/kit/log/level"
++	"github.com/go-kit/log"
++	"github.com/go-kit/log/level"
+ 	"github.com/oklog/run"
+ 	"kubesphere.io/fluentbit-operator/pkg/filenotify"
+ )
+@@ -23,39 +23,46 @@ const (
+ 	defaultCfgPath      = "/fluent-bit/etc/fluent-bit.conf"
+ 	defaultWatchDir     = "/fluent-bit/config"
+ 	defaultPollInterval = 1 * time.Second
++	defaultFlbTimeout   = 30 * time.Second
+ 
+ 	MaxDelayTime = 5 * time.Minute
+ 	ResetTime    = 10 * time.Minute
+ )
+ 
+ var (
+-	logger       log.Logger
+-	cmd          *exec.Cmd
+-	mutex        sync.Mutex
+-	restartTimes int32
+-	timerCtx     context.Context
+-	timerCancel  context.CancelFunc
++	logger        log.Logger
++	cmd           *exec.Cmd
++	flbTerminated chan bool
++	mutex         sync.Mutex
++	restartTimes  int32
++	timerCtx      context.Context
++	timerCancel   context.CancelFunc
+ )
+ 
+ var configPath string
++var externalPluginPath string
+ var binPath string
+ var watchPath string
+ var poll bool
+ var exitOnFailure bool
+ var pollInterval time.Duration
++var flbTerminationTimeout time.Duration
+ 
+ func main() {
+ 
+ 	flag.StringVar(&binPath, "b", defaultBinPath, "The fluent bit binary path.")
+ 	flag.StringVar(&configPath, "c", defaultCfgPath, "The config file path.")
++	flag.StringVar(&externalPluginPath, "e", "", "Path to external plugin (shared lib)")
+ 	flag.BoolVar(&exitOnFailure, "exit-on-failure", false, "If fluentbit exits with failure, also exit the watcher.")
+ 	flag.StringVar(&watchPath, "watch-path", defaultWatchDir, "The path to watch.")
+ 	flag.BoolVar(&poll, "poll", false, "Use poll watcher instead of ionotify.")
+ 	flag.DurationVar(&pollInterval, "poll-interval", defaultPollInterval, "Poll interval if using poll watcher.")
++	flag.DurationVar(&flbTerminationTimeout, "flb-timeout", defaultFlbTimeout, "Time to wait for FluentBit to gracefully terminate before sending SIGKILL.")
+ 
+ 	flag.Parse()
+ 
+ 	logger = log.NewLogfmtLogger(os.Stdout)
++	logger = log.With(logger, "time", log.TimestampFormat(time.Now, time.RFC3339))
+ 
+ 	timerCtx, timerCancel = context.WithCancel(context.Background())
+ 
+@@ -127,14 +134,14 @@ func main() {
+ 						if !isValidEvent(event) {
+ 							continue
+ 						}
+-
+-						_ = level.Info(logger).Log("msg", "Config file changed, stopping Fluent Bit")
+-
+ 						// After the config file changed, it should stop the fluent bit,
+ 						// and resets the restart backoff timer.
+-						stop()
+-						resetTimer()
+-						_ = level.Info(logger).Log("msg", "Config file changed, stopped Fluent Bit")
++						if cmd != nil {
++							_ = level.Info(logger).Log("msg", "Config file changed, stopping Fluent Bit")
++							stop()
++							resetTimer()
++							_ = level.Info(logger).Log("msg", "Config file changed, stopped Fluent Bit")
++						}
+ 					case <-watcher.Errors():
+ 						_ = level.Error(logger).Log("msg", "Watcher stopped")
+ 						return nil
+@@ -178,7 +185,6 @@ func isValidEvent(event fsnotify.Event) bool {
+ }
+ 
+ func start() {
+-
+ 	mutex.Lock()
+ 	defer mutex.Unlock()
+ 
+@@ -186,9 +192,14 @@ func start() {
+ 		return
+ 	}
+ 
+-	cmd = exec.Command(binPath, "-c", configPath)
++	if externalPluginPath != "" {
++		cmd = exec.Command(binPath, "-c", configPath, "-e", externalPluginPath)
++	} else {
++		cmd = exec.Command(binPath, "-c", configPath)
++	}
+ 	cmd.Stdout = os.Stdout
+ 	cmd.Stderr = os.Stderr
++	flbTerminated = make(chan bool, 1)
+ 	if err := cmd.Start(); err != nil {
+ 		_ = level.Error(logger).Log("msg", "start Fluent bit error", "error", err)
+ 		cmd = nil
+@@ -207,17 +218,20 @@ func wait() error {
+ 	mutex.Unlock()
+ 
+ 	startTime := time.Now()
++
+ 	err := cmd.Wait()
+-	_ = level.Error(logger).Log("msg", "Fluent bit exited", "error", err)
++	if err != nil {
++		_ = level.Error(logger).Log("msg", "Fluent bit exited", "error", err)
++	}
++	cmd = nil
++	flbTerminated <- true
++
+ 	// Once the fluent bit has executed for 10 minutes without any problems,
+ 	// it should resets the restart backoff timer.
+ 	if time.Since(startTime) >= ResetTime {
+ 		atomic.StoreInt32(&restartTimes, 0)
+ 	}
+ 
+-	mutex.Lock()
+-	cmd = nil
+-	mutex.Unlock()
+ 	return err
+ }
+ 
+@@ -261,10 +275,20 @@ func stop() {
+ 		return
+ 	}
+ 
++	// Send SIGTERM, if fluent-bit doesn't terminate in the specified timeframe, send SIGKILL
+ 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+-		_ = level.Info(logger).Log("msg", "Kill Fluent Bit error", "error", err)
++		_ = level.Info(logger).Log("msg", "Error while terminating FluentBit", "error", err)
+ 	} else {
+-		_ = level.Info(logger).Log("msg", "Killed Fluent Bit")
++		_ = level.Info(logger).Log("msg", "Sent SIGTERM to FluentBit, waiting max "+flbTerminationTimeout.String())
++	}
++
++	select {
++	case <-time.After(flbTerminationTimeout):
++		_ = level.Info(logger).Log("msg", "FluentBit failed to terminate gracefully, killing process")
++		cmd.Process.Kill()
++		<-flbTerminated
++	case <-flbTerminated:
++		_ = level.Info(logger).Log("msg", "FluentBit terminated successfully")
+ 	}
+ }
+ 
+diff --git a/go.mod b/go.mod
+index 2f2a82e..3caa054 100644
+--- a/go.mod
++++ b/go.mod
+@@ -4,7 +4,7 @@ go 1.16
+ 
+ require (
+ 	github.com/fsnotify/fsnotify v1.4.9
+-	github.com/go-kit/kit v0.9.0
++	github.com/go-kit/log v0.1.0
+ 	github.com/go-logr/logr v0.4.0
+ 	github.com/go-openapi/errors v0.19.2
+ 	github.com/joho/godotenv v1.3.0
+diff --git a/go.sum b/go.sum
+index 05493fb..5313391 100644
+--- a/go.sum
++++ b/go.sum
+@@ -114,8 +114,8 @@ github.com/go-gl/glfw v0.0.0-20190409004039-e6da0acd62b1/go.mod h1:vR7hzQXu2zJy9
+ github.com/go-gl/glfw/v3.3/glfw v0.0.0-20191125211704-12ad95a8df72/go.mod h1:tQ2UAYgL5IevRw8kRxooKSPJfGvJ9fJQFa0TUsXzTg8=
+ github.com/go-gl/glfw/v3.3/glfw v0.0.0-20200222043503-6f7a984d4dc4/go.mod h1:tQ2UAYgL5IevRw8kRxooKSPJfGvJ9fJQFa0TUsXzTg8=
+ github.com/go-kit/kit v0.8.0/go.mod h1:xBxKIO96dXMWWy0MnWVtmwkA9/13aqxPnvrjFYMA2as=
+-github.com/go-kit/kit v0.9.0 h1:wDJmvq38kDhkVxi50ni9ykkdUr1PKgqKOoi01fa0Mdk=
+ github.com/go-kit/kit v0.9.0/go.mod h1:xBxKIO96dXMWWy0MnWVtmwkA9/13aqxPnvrjFYMA2as=
++github.com/go-kit/log v0.1.0 h1:DGJh0Sm43HbOeYDNnVZFl8BvcYVvjD5bqYJvp0REbwQ=
+ github.com/go-kit/log v0.1.0/go.mod h1:zbhenjAZHb184qTLMA9ZjW7ThYL0H2mk7Q6pNt4vbaY=
+ github.com/go-logfmt/logfmt v0.3.0/go.mod h1:Qt1PoO58o5twSAckw1HlFXLmHsOX5/0LbT9GBnD5lWE=
+ github.com/go-logfmt/logfmt v0.4.0/go.mod h1:3RMwSq7FuexP4Kalkev3ejPJsZTpXXBr9+V4qmtdjCk=
+-- 
+2.16.2
+
