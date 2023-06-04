@@ -4,7 +4,7 @@ go 1.16
 
 require (
 	github.com/fsnotify/fsnotify v1.4.9
-	github.com/go-kit/kit v0.9.0
+	github.com/go-kit/log v0.1.0
 	github.com/go-logr/logr v0.4.0
 	github.com/go-openapi/errors v0.19.2
 	github.com/joho/godotenv v1.3.0

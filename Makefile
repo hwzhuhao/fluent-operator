@@ -63,18 +63,25 @@ test: manifests generate fmt vet ## Run tests.
 
 ##@ Build
 
+# Build manager and watcher binary
 binary:
 	go build -o bin/manager cmd/manager/main.go
 	go build -o bin/watcher cmd/fluent-bit-watcher/main.go
+
+# Clean manager and watcher binary
+clean:
+	rm -rf bin/*
 
 verify: verify-crds
 
 verify-crds:
 	sudo chmod a+x ./hack/verify-crds.sh && ./hack/verify-crds.sh
 
-build: generate fmt vet ## Build manager binary.
+# Build manager binary
+build: generate fmt vet 
 	go build -o bin/manager cmd/manager/main.go
 
+# Run manager
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run cmd/manager/main.go
 
